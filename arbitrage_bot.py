@@ -93,35 +93,58 @@ class PolymarketClient:
         # Try multiple strategies to get maximum markets
         logger.info("🔍 Fetching ALL available markets...")
 
-        # Strategy 1: Gamma API with high limit
-        markets = await self._fetch_from_gamma_paginated()
-        if markets:
-            all_markets.extend(markets)
-            logger.info(f"✓ Fetched {len(markets)} markets from Gamma API")
-
-        # Strategy 2: CLOB API with pagination
+        # Strategy 1: CLOB sampling-markets (most reliable with proper token structure)
         clob_markets = await self._fetch_from_clob_paginated()
         if clob_markets:
-            # Deduplicate by market ID
-            existing_ids = {m.get('condition_id') or m.get('id') or m.get('market_id') for m in all_markets}
-            new_markets = [m for m in clob_markets
-                          if (m.get('condition_id') or m.get('id') or m.get('market_id')) not in existing_ids]
-            all_markets.extend(new_markets)
-            logger.info(f"✓ Fetched {len(clob_markets)} markets from CLOB API ({len(new_markets)} new)")
+            all_markets.extend(clob_markets)
+            logger.info(f"✓ Fetched {len(clob_markets)} markets from CLOB API")
+
+        # Strategy 2: Gamma API as backup
+        if len(all_markets) < 100:
+            gamma_markets = await self._fetch_from_gamma_paginated()
+            if gamma_markets:
+                # Deduplicate by market ID
+                existing_ids = {m.get('condition_id') or m.get('id') or m.get('market_id') for m in all_markets}
+                new_markets = [m for m in gamma_markets
+                              if (m.get('condition_id') or m.get('id') or m.get('market_id')) not in existing_ids]
+                all_markets.extend(new_markets)
+                logger.info(f"✓ Fetched {len(gamma_markets)} markets from Gamma API ({len(new_markets)} new)")
 
         if not all_markets:
             logger.warning("⚠️  Could not fetch markets from any endpoint")
             return []
 
+        # Enrich markets with full details from CLOB API to get token_ids
+        logger.info("🔧 Enriching markets with CLOB details...")
+        enriched_markets = []
+
+        for i, market in enumerate(all_markets[:100]):  # Limit to 100 for testing
+            condition_id = market.get('condition_id') or market.get('conditionId')
+
+            if condition_id and condition_id.strip():  # Only if we have a valid condition_id
+                # Fetch full market details from CLOB
+                full_market = await self._fetch_market_from_clob(condition_id)
+                if full_market:
+                    enriched_markets.append(full_market)
+                else:
+                    enriched_markets.append(market)  # Fallback to original
+
+                if (i + 1) % 20 == 0:
+                    logger.info(f"  Enriched {i + 1}/{min(len(all_markets), 100)} markets...")
+
+                await asyncio.sleep(0.05)  # Rate limiting
+            else:
+                enriched_markets.append(market)
+
         # Cache all markets
-        for market in all_markets:
+        for market in enriched_markets:
             market_id = market.get('id') or market.get('condition_id') or market.get('market_id')
             if market_id:
                 self.markets_cache[market_id] = market
 
-        self.diagnostics['markets_fetched'] = len(all_markets)
-        logger.info(f"📊 TOTAL MARKETS LOADED: {len(all_markets)}")
-        return all_markets
+        self.diagnostics['markets_fetched'] = len(enriched_markets)
+        logger.info(f"📊 TOTAL MARKETS LOADED: {len(enriched_markets)}")
+        return enriched_markets
 
     async def _fetch_from_gamma_paginated(self) -> List[Dict]:
         """Fetch from Gamma API with pagination"""
@@ -198,6 +221,27 @@ class PolymarketClient:
         except Exception as e:
             logger.debug(f"CLOB API pagination error: {e}")
             return all_markets
+
+    async def _fetch_market_from_clob(self, condition_id: str) -> Optional[Dict]:
+        """Fetch full market details from CLOB API by condition_id"""
+        try:
+            url = f"{self.CLOB_URL}/markets/{condition_id}"
+
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (compatible; ArbitrageBot/1.0)',
+            }
+
+            async with self.session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    market = await resp.json()
+                    return market
+                else:
+                    logger.debug(f"CLOB market fetch returned {resp.status} for {condition_id}")
+                    return None
+
+        except Exception as e:
+            logger.debug(f"Error fetching market from CLOB: {e}")
+            return None
 
     async def get_orderbook(self, token_id: str) -> Optional[Dict]:
         """Get orderbook for a specific outcome token"""
@@ -403,7 +447,12 @@ class ArbitrageDetector:
             liquidities = []
 
             for token in tokens:
-                token_id = token.get('token_id') or token.get('id')
+                # Extract token_id from dict
+                if isinstance(token, dict):
+                    token_id = token.get('token_id') or token.get('id')
+                else:
+                    return None  # Can't process string tokens
+
                 if not token_id or token_id not in orderbooks:
                     return None
 
@@ -641,31 +690,54 @@ class PredictionMarketBot:
                              market.get('description') or
                              'Unknown')[:60]
 
-                # Get tokens
-                tokens = (market.get('tokens') or
-                        market.get('outcomes') or
-                        market.get('options') or [])
+                # Get tokens - CLOB API returns 'tokens' array with proper structure
+                tokens = market.get('tokens') or []
 
-                if tokens:
+                # Parse if it's a JSON string (from Gamma API)
+                if isinstance(tokens, str):
+                    try:
+                        tokens = json.loads(tokens)
+                    except:
+                        tokens = []
+
+                # If tokens is still empty, try other fields
+                if not tokens:
+                    outcomes = market.get('outcomes') or market.get('options') or []
+                    if isinstance(outcomes, str):
+                        try:
+                            outcomes = json.loads(outcomes)
+                        except:
+                            outcomes = []
+                    tokens = outcomes
+
+                if tokens and isinstance(tokens, list):
                     client.diagnostics['markets_with_tokens'] += 1
 
-                if not tokens:
+                if not tokens or not isinstance(tokens, list):
                     continue
 
                 # Log first market with tokens for debugging
                 if client.diagnostics['markets_with_tokens'] == 1:
-                    logger.info(f"📍 Full market structure: {json.dumps(market, indent=2)}")
+                    logger.info(f"📍 Sample market keys: {list(market.keys())}")
                     logger.info(f"📍 Tokens found: {json.dumps(tokens, indent=2)}")
 
                 # Fetch orderbooks for all tokens
                 orderbooks = {}
                 for token in tokens[:10]:  # Limit to 10 tokens max
-                    token_id = token.get('token_id') or token.get('id')
+                    # Handle different token formats
+                    if isinstance(token, dict):
+                        # CLOB API format: {token_id: "...", outcome: "Yes", ...}
+                        token_id = token.get('token_id') or token.get('id')
+                    elif isinstance(token, str):
+                        # Gamma API format: just strings like "Yes", "No" - we can't fetch orderbooks
+                        token_id = None
+                    else:
+                        token_id = None
 
                     # Debug: Log what token_id we're trying to use
                     if client.diagnostics['markets_with_tokens'] <= 3:
-                        logger.info(f"🔎 Trying to fetch orderbook for token_id: {token_id}")
-                        logger.info(f"🔎 Token structure: {json.dumps(token, indent=2)}")
+                        logger.info(f"🔎 Token: {token}")
+                        logger.info(f"🔎 Extracted token_id: {token_id}")
 
                     if token_id:
                         book = await client.get_orderbook(token_id)
@@ -673,26 +745,36 @@ class PredictionMarketBot:
                             orderbooks[token_id] = book
                             # Log first orderbook for debugging
                             if client.diagnostics['orderbooks_with_data'] == 1:
-                                logger.info(f"📍 Sample orderbook structure: {json.dumps(book, indent=2)[:500]}")
+                                logger.info(f"✅ Got orderbook! Structure: {json.dumps(book, indent=2)[:500]}")
                         else:
                             if client.diagnostics['markets_with_tokens'] <= 3:
                                 logger.info(f"❌ Failed to fetch orderbook for token_id: {token_id}")
                         await asyncio.sleep(0.05)  # Rate limiting
+                    else:
+                        if client.diagnostics['markets_with_tokens'] <= 3:
+                            logger.info(f"⚠️  No token_id found for token: {token}")
 
                 # Detect Single-Condition Arbitrage
                 if len(tokens) == 2:
-                    token1_id = tokens[0].get('token_id') or tokens[0].get('id')
-                    token2_id = tokens[1].get('token_id') or tokens[1].get('id')
+                    # Extract token IDs
+                    token1_id = None
+                    token2_id = None
 
-                    opp = self.detector.detect_single_condition_arbitrage(
-                        market,
-                        orderbooks.get(token1_id),
-                        orderbooks.get(token2_id)
-                    )
+                    if isinstance(tokens[0], dict):
+                        token1_id = tokens[0].get('token_id') or tokens[0].get('id')
+                    if isinstance(tokens[1], dict):
+                        token2_id = tokens[1].get('token_id') or tokens[1].get('id')
 
-                    if opp:
-                        opportunities.append(opp)
-                        self.alert_manager.display_opportunity(opp)
+                    if token1_id and token2_id:
+                        opp = self.detector.detect_single_condition_arbitrage(
+                            market,
+                            orderbooks.get(token1_id),
+                            orderbooks.get(token2_id)
+                        )
+
+                        if opp:
+                            opportunities.append(opp)
+                            self.alert_manager.display_opportunity(opp)
 
                 # Detect NegRisk Arbitrage
                 elif len(tokens) >= 3:
