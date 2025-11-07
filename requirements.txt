@@ -1,0 +1,8 @@
+# Prediction Market Arbitrage Bot Dependencies
+# All packages are free and open-source
+
+aiohttp==3.9.1
+websockets==12.0
+pandas==2.1.4
+numpy==1.26.2
+python-dateutil==2.8.2
