@@ -1,52 +1,110 @@
 #!/usr/bin/env python3
 
 """
-Prediction Market Arbitrage Bot - FULL MARKET SCANNER WITH DIAGNOSTICS
+Prediction Market Arbitrage Bot - Enhanced Full Market Scanner
 
 Based on IMDEA Networks research: $39.59M arbitrage extraction (Apr 2024-Apr 2025)
 
 Strategies Implemented:
-1. Single-Condition Arbitrage (YES + NO ≠ $1.00) - $10.58M extracted
-2. NegRisk Rebalancing (Σ(prices) ≠ 1.00) - $28.99M extracted (29× capital efficiency)
-3. Whale Tracking - Follow informed traders
+1. Single-Condition Arbitrage (YES + NO != $1.00) - $10.58M extracted
+2. NegRisk Rebalancing (sum(prices) != 1.00) - $28.99M extracted (29x capital efficiency)
 
-FREE Data Sources:
-- Polymarket CLOB API (REST)
-- Gamma Markets API (backup)
-- Public market data, no auth required
+Enhancements:
+- 3-step scan: NegRisk events first -> hot markets by volume -> merge & dedup
+- Best ask price detection with fee/gas deduction
+- Complete set cost calculation with merge advice
+- Orderbook slippage estimation
+- Telegram + Discord notifications
+- WebSocket real-time price updates
+- JSON structured logging
 """
 
 import asyncio
 import aiohttp
 import json
-import pandas as pd
+import time
+import sqlite3
 import numpy as np
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
-from collections import defaultdict, deque
+from datetime import datetime
+from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from collections import defaultdict
 import logging
+
+from config import (
+    # Scanning
+    SCAN_RANGE, SCAN_INTERVAL, BATCH_SIZE,
+    RATE_LIMIT_RETRY_SLEEP, RATE_LIMIT_MAX_RETRIES,
+    NEGRISK_LIMIT,
+    # Detection
+    MIN_PROFIT_THRESHOLD, MAX_PROFIT_THRESHOLD, MIN_LIQUIDITY,
+    CAPITAL_EFFICIENCY_MULTIPLIER, POLYMARKET_FEE_PCT, GAS_BUFFER_PCT,
+    HIGH_URGENCY_ROI, MEDIUM_URGENCY_ROI,
+    # Mid price screening
+    MID_SUM_THRESHOLD, MID_SUM_UPPER, BINARY_TOP_N_BY_VOLUME, NEGRISK_TOP_N_BY_VOLUME,
+    NEGRISK_MIN_CONDITIONS,
+    # API
+    POLYMARKET_CLOB_URL, POLYMARKET_GAMMA_URL, API_TIMEOUT,
+    DELAY_BETWEEN_MARKETS, DELAY_BETWEEN_ORDERBOOKS, DELAY_BETWEEN_BATCHES,
+    # Notifications
+    NOTIFICATION_METHODS, ALERT_RATE_LIMIT_SECONDS,
+    # WebSocket
+    WS_ENABLED, WS_SUBS_LIMIT, WS_FALLBACK_INTERVAL,
+    # Slippage
+    SLIPPAGE_TOLERANCE, DEFAULT_TRADE_SIZE, ORDERBOOK_DEPTH,
+    # DB & Background
+    DB_FILE, BACKGROUND_SCAN_INTERVAL,
+    # Logging
+    LOG_LEVEL, LOG_FILE,
+)
+
 import warnings
 warnings.filterwarnings('ignore')
 
-# Configure logging
+
+# ============================================================================
+# JSON LOGGING
+# ============================================================================
+
+class JsonFormatter(logging.Formatter):
+    """JSON log formatter for structured logging"""
+    def format(self, record):
+        log_entry = {
+            "time": self.formatTime(record),
+            "level": record.levelname,
+            "module": record.module,
+            "message": record.getMessage()
+        }
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_entry, ensure_ascii=False)
+
+
+json_formatter = JsonFormatter()
+
+file_handler = logging.FileHandler(LOG_FILE)
+file_handler.setFormatter(json_formatter)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('arbitrage_bot.log'),
-        logging.StreamHandler()
-    ]
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    handlers=[file_handler, console_handler]
 )
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
+# DATA CLASSES
+# ============================================================================
 
 @dataclass
 class ArbitrageOpportunity:
     """Represents a detected arbitrage opportunity"""
     market_id: str
     market_name: str
-    opportunity_type: str  # 'single_condition', 'negrisk', 'whale'
+    opportunity_type: str  # 'single_condition', 'negrisk'
     expected_profit: float
     roi: float
     capital_required: float
@@ -54,30 +112,32 @@ class ArbitrageOpportunity:
     urgency: str  # 'high', 'medium', 'low'
     details: Dict
     timestamp: datetime
+    # Enhanced fields
+    net_profit_after_fees: float = 0.0
+    merge_advice: str = ""
+    estimated_slippage: float = 0.0
+    net_profit_after_slippage: float = 0.0
 
+
+# ============================================================================
+# POLYMARKET CLIENT - ORDERBOOK ONLY (scanning offloaded to scanner_process)
+# ============================================================================
 
 class PolymarketClient:
-    """Free Polymarket API client - multiple endpoints for reliability"""
-
-    # Multiple API endpoints for redundancy
-    CLOB_URL = "https://clob.polymarket.com"
-    GAMMA_URL = "https://gamma-api.polymarket.com"
-    STRAPI_URL = "https://strapi-matic.poly.market"
+    """Lightweight Polymarket API client for orderbook fetching only.
+    Market scanning is handled by the background scanner_process."""
 
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
-        self.markets_cache = {}
-        self.orderbook_cache = defaultdict(lambda: deque(maxlen=100))
         self.diagnostics = {
-            'markets_fetched': 0,
-            'markets_with_tokens': 0,
             'orderbooks_fetched': 0,
             'orderbooks_with_data': 0,
-            'markets_analyzed': 0
+            'markets_with_tokens': 0,
+            'markets_analyzed': 0,
         }
 
     async def __aenter__(self):
-        timeout = aiohttp.ClientTimeout(total=30)
+        timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
         self.session = aiohttp.ClientSession(timeout=timeout)
         return self
 
@@ -85,260 +145,188 @@ class PolymarketClient:
         if self.session:
             await self.session.close()
 
-    async def get_all_markets(self) -> List[Dict]:
-        """Fetch ALL active markets using pagination"""
-
-        all_markets = []
-
-        # Try multiple strategies to get maximum markets
-        logger.info("🔍 Fetching ALL available markets...")
-
-        # Strategy 1: CLOB sampling-markets (most reliable with proper token structure)
-        clob_markets = await self._fetch_from_clob_paginated()
-        if clob_markets:
-            all_markets.extend(clob_markets)
-            logger.info(f"✓ Fetched {len(clob_markets)} markets from CLOB API")
-
-        # Strategy 2: Gamma API as backup
-        if len(all_markets) < 100:
-            gamma_markets = await self._fetch_from_gamma_paginated()
-            if gamma_markets:
-                # Deduplicate by market ID
-                existing_ids = {m.get('condition_id') or m.get('id') or m.get('market_id') for m in all_markets}
-                new_markets = [m for m in gamma_markets
-                              if (m.get('condition_id') or m.get('id') or m.get('market_id')) not in existing_ids]
-                all_markets.extend(new_markets)
-                logger.info(f"✓ Fetched {len(gamma_markets)} markets from Gamma API ({len(new_markets)} new)")
-
-        if not all_markets:
-            logger.warning("⚠️  Could not fetch markets from any endpoint")
-            return []
-
-        # Enrich markets with full details from CLOB API to get token_ids
-        logger.info("🔧 Enriching markets with CLOB details...")
-        enriched_markets = []
-
-        max_markets = min(len(all_markets), 200)  # Process up to 200 markets per scan
-        for i, market in enumerate(all_markets[:max_markets]):
-            condition_id = market.get('condition_id') or market.get('conditionId')
-
-            if condition_id and condition_id.strip():  # Only if we have a valid condition_id
-                # Fetch full market details from CLOB
-                full_market = await self._fetch_market_from_clob(condition_id)
-                if full_market:
-                    enriched_markets.append(full_market)
-                else:
-                    enriched_markets.append(market)  # Fallback to original
-
-                if (i + 1) % 50 == 0:
-                    logger.info(f"  Enriched {i + 1}/{max_markets} markets...")
-
-                await asyncio.sleep(0.05)  # Rate limiting
-            else:
-                enriched_markets.append(market)
-
-        # Cache all markets
-        for market in enriched_markets:
-            market_id = market.get('id') or market.get('condition_id') or market.get('market_id')
-            if market_id:
-                self.markets_cache[market_id] = market
-
-        self.diagnostics['markets_fetched'] = len(enriched_markets)
-        logger.info(f"📊 TOTAL MARKETS LOADED: {len(enriched_markets)}")
-        return enriched_markets
-
-    async def _fetch_from_gamma_paginated(self) -> List[Dict]:
-        """Fetch from Gamma API with pagination"""
-        all_markets = []
-
-        try:
-            # Fetch in batches
-            for offset in range(0, 1000, 100):  # Try up to 1000 markets
-                url = f"{self.GAMMA_URL}/markets"
-                params = {
-                    'limit': 100,
-                    'offset': offset,
-                    'active': 'true',
-                    'closed': 'false'
-                }
-
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (compatible; ArbitrageBot/1.0)',
-                }
-
-                async with self.session.get(url, params=params, headers=headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-
-                        # Handle different response formats
-                        if isinstance(data, list):
-                            markets = data
-                        elif isinstance(data, dict) and 'data' in data:
-                            markets = data['data']
-                        elif isinstance(data, dict) and 'markets' in data:
-                            markets = data['markets']
-                        else:
-                            markets = []
-
-                        if not markets:
-                            break  # No more markets
-
-                        all_markets.extend(markets)
-
-                        if len(markets) < 100:
-                            break  # Last page
-
-                        await asyncio.sleep(0.2)  # Rate limiting
-                    else:
-                        break
-
-            return all_markets
-
-        except Exception as e:
-            logger.debug(f"Gamma API pagination error: {e}")
-            return all_markets
-
-    async def _fetch_from_clob_paginated(self) -> List[Dict]:
-        """Fetch from CLOB API with pagination"""
-        all_markets = []
-
-        try:
-            # Try sampling-markets endpoint which is more reliable
-            url = f"{self.CLOB_URL}/sampling-markets"
-            params = {'limit': 500}
-
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (compatible; ArbitrageBot/1.0)',
-            }
-
-            async with self.session.get(url, params=params, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    markets = data if isinstance(data, list) else []
-                    all_markets.extend(markets)
-
-            return all_markets
-
-        except Exception as e:
-            logger.debug(f"CLOB API pagination error: {e}")
-            return all_markets
-
-    async def _fetch_market_from_clob(self, condition_id: str) -> Optional[Dict]:
-        """Fetch full market details from CLOB API by condition_id"""
-        try:
-            url = f"{self.CLOB_URL}/markets/{condition_id}"
-
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (compatible; ArbitrageBot/1.0)',
-            }
-
-            async with self.session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    market = await resp.json()
-                    return market
-                else:
-                    logger.debug(f"CLOB market fetch returned {resp.status} for {condition_id}")
-                    return None
-
-        except Exception as e:
-            logger.debug(f"Error fetching market from CLOB: {e}")
-            return None
-
     async def get_orderbook(self, token_id: str) -> Optional[Dict]:
         """Get orderbook for a specific outcome token"""
         if not token_id:
             return None
-
         try:
-            url = f"{self.CLOB_URL}/book"
+            url = f"{POLYMARKET_CLOB_URL}/book"
             params = {'token_id': token_id}
-
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (compatible; ArbitrageBot/1.0)',
-            }
+            headers = {'User-Agent': 'Mozilla/5.0 (compatible; ArbitrageBot/2.0)'}
 
             async with self.session.get(url, params=params, headers=headers) as resp:
                 self.diagnostics['orderbooks_fetched'] += 1
-
                 if resp.status == 200:
                     book = await resp.json()
-
-                    # Check if orderbook has actual data
                     if book and (book.get('asks') or book.get('bids')):
                         self.diagnostics['orderbooks_with_data'] += 1
-
                     return book
-                else:
-                    # Log non-200 responses for debugging
-                    if self.diagnostics['orderbooks_fetched'] <= 5:
-                        text = await resp.text()
-                        logger.info(f"❌ Orderbook API returned {resp.status} for token {token_id}: {text[:200]}")
-                    return None
+                return None
         except Exception as e:
-            if self.diagnostics['orderbooks_fetched'] <= 5:
-                logger.info(f"❌ Exception fetching orderbook for {token_id}: {e}")
+            logger.debug(f"Orderbook fetch error for {token_id}: {e}")
             return None
 
-    async def get_market_trades(self, market_id: str, limit: int = 100) -> List[Dict]:
-        """Get recent trades for whale tracking"""
-        if not market_id:
-            return []
 
+# ============================================================================
+# ORDERBOOK HELPERS
+# ============================================================================
+
+def _get_best_ask(asks) -> float:
+    """Get the lowest ask price from an asks list."""
+    if not asks:
+        return 0.0
+    try:
+        if isinstance(asks[0], dict):
+            return float(asks[0].get('price', 0))
+        elif isinstance(asks[0], (list, tuple)):
+            return float(asks[0][0])
+        else:
+            return float(asks[0])
+    except (ValueError, TypeError, IndexError):
+        return 0.0
+
+
+def _get_best_bid(bids) -> float:
+    """Get the highest bid price from a bids list."""
+    if not bids:
+        return 0.0
+    try:
+        # bids may be sorted ascending or descending; take max as best bid
+        bid_prices = []
+        for b in bids:
+            if isinstance(b, dict):
+                bid_prices.append(float(b.get('price', 0)))
+            elif isinstance(b, (list, tuple)):
+                bid_prices.append(float(b[0]))
+            else:
+                bid_prices.append(float(b))
+        return max(bid_prices) if bid_prices else 0.0
+    except (ValueError, TypeError, IndexError):
+        return 0.0
+
+
+def _parse_tokens(market: Dict) -> list:
+    """Parse tokens list from a market dict, handling JSON strings and clob_token_ids fallback."""
+    tokens = market.get('tokens') or []
+    if isinstance(tokens, str):
         try:
-            # Try CLOB trades endpoint
-            url = f"{self.CLOB_URL}/trades"
-            params = {'market': market_id, 'limit': limit}
+            tokens = json.loads(tokens)
+        except Exception:
+            tokens = []
 
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (compatible; ArbitrageBot/1.0)',
-            }
+    if not tokens:
+        clob_token_ids = market.get('clob_token_ids')
+        outcomes_str = market.get('outcomes') or market.get('options') or []
 
-            async with self.session.get(url, params=params, headers=headers) as resp:
-                if resp.status == 200:
-                    trades = await resp.json()
-                    return trades if isinstance(trades, list) else []
-                return []
-        except Exception as e:
-            logger.debug(f"Error fetching trades: {e}")
-            return []
+        if clob_token_ids and outcomes_str:
+            if isinstance(outcomes_str, str):
+                try:
+                    outcomes_list = json.loads(outcomes_str)
+                except Exception:
+                    outcomes_list = []
+            else:
+                outcomes_list = outcomes_str
 
+            if isinstance(clob_token_ids, str):
+                try:
+                    token_ids_list = json.loads(clob_token_ids)
+                except Exception:
+                    token_ids_list = []
+            else:
+                token_ids_list = clob_token_ids if isinstance(clob_token_ids, list) else []
+
+            if len(token_ids_list) == len(outcomes_list):
+                tokens = [
+                    {'outcome': out, 'token_id': tid}
+                    for out, tid in zip(outcomes_list, token_ids_list)
+                ]
+
+    return tokens if isinstance(tokens, list) else []
+
+
+# ============================================================================
+# ARBITRAGE DETECTOR - ENHANCED
+# ============================================================================
 
 class ArbitrageDetector:
-    """Implements arbitrage detection strategies from IMDEA research"""
-
-    # Research-backed thresholds - Based on 2024-2025 market analysis
-    # Real arbitrage found: 1-2.5% typical, up to 18% exceptional
-    MIN_PROFIT_THRESHOLD = 0.005  # 0.5 cents minimum (captures 0.5%+ spreads)
-    MAX_PROFIT_THRESHOLD = 0.50  # 50 cents max (filter out stale markets)
-    MIN_LIQUIDITY = 5.0  # $5 minimum for realistic trading
-    NEGRISK_MULTIPLIER = 29  # 29× capital efficiency advantage
-    WHALE_THRESHOLD = 1000  # $1,000+ trades
-    HIGH_URGENCY_ROI = 0.10  # 10%+ ROI (research shows this is common)
-    MEDIUM_URGENCY_ROI = 0.025  # 2.5%+ ROI (typical range)
+    """Enhanced arbitrage detection with best-ask, fee deduction, slippage"""
 
     def __init__(self):
         self.opportunities: List[ArbitrageOpportunity] = []
-        self.whale_addresses = set()
         self.diagnostics = {
             'single_condition_checked': 0,
             'single_condition_found': 0,
             'negrisk_checked': 0,
             'negrisk_found': 0,
-            'whale_checked': 0,
-            'whale_found': 0,
             'no_orderbook': 0,
-            'no_prices': 0
+            'no_prices': 0,
+            'filtered_low_liquidity': 0,
+            'filtered_high_slippage': 0,
         }
 
+    # ------------------------------------------------------------------
+    # Buy/Sell arb cost calculations
+    # ------------------------------------------------------------------
+    @staticmethod
+    def calculate_buy_arb(ask_prices: List[float]) -> Dict:
+        """
+        Buy arb: buy all outcomes at best ask, merge for $1.
+        Profit = 1.0 - sum(asks) - fees - gas.
+        """
+        ask_sum = sum(ask_prices)
+        fees = ask_sum * POLYMARKET_FEE_PCT
+        gas = ask_sum * GAS_BUFFER_PCT
+        total_cost = ask_sum + fees + gas
+        net_profit = 1.0 - total_cost
+        roi = (net_profit / total_cost * 100) if total_cost > 0 else 0
+        return {
+            'ask_sum': ask_sum,
+            'fees': fees,
+            'gas': gas,
+            'total_cost': total_cost,
+            'capital_required': total_cost,
+            'net_profit': net_profit,
+            'roi_pct': roi,
+        }
+
+    @staticmethod
+    def calculate_sell_arb(bid_prices: List[float]) -> Dict:
+        """
+        Sell arb: mint complete set for $1, sell all at best bid.
+        Profit = sum(bids) - 1.0 - fees - gas.
+        """
+        bid_sum = sum(bid_prices)
+        fees = bid_sum * POLYMARKET_FEE_PCT
+        gas = bid_sum * GAS_BUFFER_PCT
+        total_income = bid_sum - fees - gas
+        net_profit = total_income - 1.0
+        roi = (net_profit / 1.0 * 100) if net_profit > 0 else 0
+        return {
+            'bid_sum': bid_sum,
+            'fees': fees,
+            'gas': gas,
+            'total_income': total_income,
+            'capital_required': 1.0,  # mint cost
+            'net_profit': net_profit,
+            'roi_pct': roi,
+        }
+
+    # ------------------------------------------------------------------
+    # Single-Condition (Binary) Arbitrage
+    # Buy arb: YES_best_ask + NO_best_ask < 1.0 -> buy both + merge
+    # Sell arb: YES_best_bid + NO_best_bid > 1.0 -> mint + sell both
+    # ------------------------------------------------------------------
     def detect_single_condition_arbitrage(
         self,
         market: Dict,
         yes_orderbook: Optional[Dict],
-        no_orderbook: Optional[Dict]
+        no_orderbook: Optional[Dict],
+        slippage_estimator=None,
     ) -> Optional[ArbitrageOpportunity]:
         """
-        Strategy 1: YES + NO ≠ $1.00
-        IMDEA Research: $10.58M extracted, 7,051 conditions
+        Binary market arbitrage (YES + NO != $1.00).
+        - Buy arb: ask_sum < 1.0 -> buy both sides + merge for $1 profit
+        - Sell arb: bid_sum > 1.0 -> mint for $1 + sell both sides for profit
         """
         self.diagnostics['single_condition_checked'] += 1
 
@@ -347,568 +335,1131 @@ class ArbitrageDetector:
             return None
 
         try:
-            # Filter out closed/archived markets
             if market.get('closed') or market.get('archived') or not market.get('active'):
                 return None
 
-            # Get best prices
             yes_asks = yes_orderbook.get('asks', [])
             no_asks = no_orderbook.get('asks', [])
+            yes_bids = yes_orderbook.get('bids', [])
+            no_bids = no_orderbook.get('bids', [])
 
-            if not yes_asks or not no_asks:
-                self.diagnostics['no_prices'] += 1
-                return None
+            yes_best_ask = _get_best_ask(yes_asks)
+            no_best_ask = _get_best_ask(no_asks)
+            yes_best_bid = _get_best_bid(yes_bids)
+            no_best_bid = _get_best_bid(no_bids)
 
-            yes_best_ask = float(yes_asks[0].get('price', 0))
-            no_best_ask = float(no_asks[0].get('price', 0))
+            logger.debug(
+                f"Binary arb check: YES ask={yes_best_ask:.4f} bid={yes_best_bid:.4f}, "
+                f"NO ask={no_best_ask:.4f} bid={no_best_bid:.4f}")
 
-            if yes_best_ask == 0 or no_best_ask == 0:
-                self.diagnostics['no_prices'] += 1
-                return None
+            market_name = (market.get('question') or market.get('title') or
+                            market.get('description') or 'Unknown Market')[:80]
+            market_id = (market.get('condition_id') or market.get('id') or
+                          market.get('market_id') or 'unknown')
+            market_slug = market.get('market_slug') or market.get('slug', '')
 
-            # Filter out placeholder/extreme prices (likely inactive markets)
-            # Real markets rarely have both sides at 0.95+
-            if yes_best_ask >= 0.95 and no_best_ask >= 0.95:
-                return None
+            # --- Buy arb: ask_sum < 1.0 ---
+            if yes_best_ask > 0 and no_best_ask > 0:
+                calc = self.calculate_buy_arb([yes_best_ask, no_best_ask])
+                net_profit_per_unit = calc['net_profit']
 
-            sum_price = yes_best_ask + no_best_ask
-            deviation = abs(1.0 - sum_price)
+                if (net_profit_per_unit > MIN_PROFIT_THRESHOLD
+                        and net_profit_per_unit < MAX_PROFIT_THRESHOLD):
+                    # Liquidity check
+                    yes_liq = sum(float(a.get('size', 0)) for a in yes_asks[:ORDERBOOK_DEPTH])
+                    no_liq = sum(float(a.get('size', 0)) for a in no_asks[:ORDERBOOK_DEPTH])
+                    min_liq = min(yes_liq, no_liq)
 
-            # Filter out unrealistic deviations (>50% = likely stale/closed market)
-            if deviation > 0.50:
-                return None
+                    if min_liq >= MIN_LIQUIDITY:
+                        expected_profit = net_profit_per_unit * min_liq
+                        capital_required = calc['capital_required'] * min_liq
+                        roi = calc['roi_pct'] / 100.0
 
-            # Log ALL deviations for debugging
-            if deviation > 0:
-                logger.debug(f"Price deviation found: {deviation:.4f} (sum={sum_price:.4f})")
+                        # Slippage check
+                        est_slippage = 0.0
+                        net_after_slippage = expected_profit
+                        if slippage_estimator:
+                            slip_yes = slippage_estimator.estimate_slippage_from_book(
+                                yes_asks, DEFAULT_TRADE_SIZE)
+                            slip_no = slippage_estimator.estimate_slippage_from_book(
+                                no_asks, DEFAULT_TRADE_SIZE)
+                            est_slippage = max(
+                                slip_yes.get('slippage_pct', 0),
+                                slip_no.get('slippage_pct', 0))
+                            if est_slippage > SLIPPAGE_TOLERANCE:
+                                self.diagnostics['filtered_high_slippage'] += 1
+                            else:
+                                slippage_cost = est_slippage * capital_required
+                                net_after_slippage = expected_profit - slippage_cost
+                                if net_after_slippage > 0:
+                                    self.diagnostics['single_condition_found'] += 1
+                                    return ArbitrageOpportunity(
+                                        market_id=str(market_id),
+                                        market_name=market_name,
+                                        opportunity_type='BUY_ARB',
+                                        expected_profit=expected_profit,
+                                        roi=roi,
+                                        capital_required=capital_required,
+                                        risk_score=self._calculate_risk_score(
+                                            market, 'single_condition'),
+                                        urgency=('high' if roi > HIGH_URGENCY_ROI
+                                                  else 'medium' if roi > MEDIUM_URGENCY_ROI
+                                                  else 'low'),
+                                        details={
+                                            'strategy': 'binary',
+                                            'ask_sum': calc['ask_sum'],
+                                            'yes_ask': yes_best_ask,
+                                            'no_ask': no_best_ask,
+                                            'fees': calc['fees'],
+                                            'liquidity': min_liq,
+                                            'market_slug': market_slug,
+                                        },
+                                        timestamp=datetime.now(),
+                                        net_profit_after_fees=expected_profit,
+                                        merge_advice="Buy YES + NO shares, merge for $1 via CTF contract",
+                                        estimated_slippage=est_slippage,
+                                        net_profit_after_slippage=net_after_slippage,
+                                    )
+                        else:
+                            # No slippage estimator
+                            self.diagnostics['single_condition_found'] += 1
+                            return ArbitrageOpportunity(
+                                market_id=str(market_id),
+                                market_name=market_name,
+                                opportunity_type='BUY_ARB',
+                                expected_profit=expected_profit,
+                                roi=roi,
+                                capital_required=capital_required,
+                                risk_score=self._calculate_risk_score(
+                                    market, 'single_condition'),
+                                urgency=('high' if roi > HIGH_URGENCY_ROI
+                                          else 'medium' if roi > MEDIUM_URGENCY_ROI
+                                          else 'low'),
+                                details={
+                                    'strategy': 'binary',
+                                    'ask_sum': calc['ask_sum'],
+                                    'yes_ask': yes_best_ask,
+                                    'no_ask': no_best_ask,
+                                    'fees': calc['fees'],
+                                    'liquidity': min_liq,
+                                    'market_slug': market_slug,
+                                },
+                                timestamp=datetime.now(),
+                                net_profit_after_fees=expected_profit,
+                                merge_advice="Buy YES + NO shares, merge for $1 via CTF contract",
+                                estimated_slippage=0.0,
+                                net_profit_after_slippage=expected_profit,
+                            )
+                    else:
+                        self.diagnostics['filtered_low_liquidity'] += 1
 
-            # Check if profitable
-            if deviation > self.MIN_PROFIT_THRESHOLD:
-                # Get liquidity
-                yes_liquidity = sum(float(ask.get('size', 0)) for ask in yes_asks[:5])
-                no_liquidity = sum(float(ask.get('size', 0)) for ask in no_asks[:5])
-                min_liquidity = min(yes_liquidity, no_liquidity)
+            # --- Sell arb: bid_sum > 1.0 ---
+            if yes_best_bid > 0 and no_best_bid > 0:
+                calc = self.calculate_sell_arb([yes_best_bid, no_best_bid])
+                net_profit_per_unit = calc['net_profit']
 
-                if min_liquidity < self.MIN_LIQUIDITY:
-                    return None
+                if (net_profit_per_unit > MIN_PROFIT_THRESHOLD
+                        and net_profit_per_unit < MAX_PROFIT_THRESHOLD):
+                    # Liquidity check (use bids for sell)
+                    yes_liq = sum(float(b.get('size', 0)) for b in yes_bids[:ORDERBOOK_DEPTH])
+                    no_liq = sum(float(b.get('size', 0)) for b in no_bids[:ORDERBOOK_DEPTH])
+                    min_liq = min(yes_liq, no_liq)
 
-                capital_required = sum_price * min_liquidity
-                expected_profit = deviation * min_liquidity
-                roi = deviation / sum_price if sum_price > 0 else 0
+                    if min_liq >= MIN_LIQUIDITY:
+                        expected_profit = net_profit_per_unit * min_liq
+                        capital_required = calc['capital_required'] * min_liq
+                        roi = calc['roi_pct'] / 100.0
 
-                # Risk scoring
-                risk_score = self._calculate_risk_score(market, 'single_condition')
+                        # Slippage check
+                        est_slippage = 0.0
+                        net_after_slippage = expected_profit
+                        if slippage_estimator:
+                            slip_yes = slippage_estimator.estimate_slippage_from_book(
+                                yes_bids, DEFAULT_TRADE_SIZE)
+                            slip_no = slippage_estimator.estimate_slippage_from_book(
+                                no_bids, DEFAULT_TRADE_SIZE)
+                            est_slippage = max(
+                                slip_yes.get('slippage_pct', 0),
+                                slip_no.get('slippage_pct', 0))
+                            if est_slippage > SLIPPAGE_TOLERANCE:
+                                self.diagnostics['filtered_high_slippage'] += 1
+                            else:
+                                slippage_cost = est_slippage * capital_required
+                                net_after_slippage = expected_profit - slippage_cost
+                                if net_after_slippage > 0:
+                                    self.diagnostics['single_condition_found'] += 1
+                                    return ArbitrageOpportunity(
+                                        market_id=str(market_id),
+                                        market_name=market_name,
+                                        opportunity_type='SELL_ARB',
+                                        expected_profit=expected_profit,
+                                        roi=roi,
+                                        capital_required=capital_required,
+                                        risk_score=self._calculate_risk_score(
+                                            market, 'single_condition'),
+                                        urgency=('high' if roi > HIGH_URGENCY_ROI
+                                                  else 'medium' if roi > MEDIUM_URGENCY_ROI
+                                                  else 'low'),
+                                        details={
+                                            'strategy': 'binary',
+                                            'bid_sum': calc['bid_sum'],
+                                            'yes_bid': yes_best_bid,
+                                            'no_bid': no_best_bid,
+                                            'fees': calc['fees'],
+                                            'liquidity': min_liq,
+                                            'market_slug': market_slug,
+                                        },
+                                        timestamp=datetime.now(),
+                                        net_profit_after_fees=expected_profit,
+                                        merge_advice="Mint complete set for $1, sell YES + NO shares",
+                                        estimated_slippage=est_slippage,
+                                        net_profit_after_slippage=net_after_slippage,
+                                    )
+                        else:
+                            # No slippage estimator
+                            self.diagnostics['single_condition_found'] += 1
+                            return ArbitrageOpportunity(
+                                market_id=str(market_id),
+                                market_name=market_name,
+                                opportunity_type='SELL_ARB',
+                                expected_profit=expected_profit,
+                                roi=roi,
+                                capital_required=capital_required,
+                                risk_score=self._calculate_risk_score(
+                                    market, 'single_condition'),
+                                urgency=('high' if roi > HIGH_URGENCY_ROI
+                                          else 'medium' if roi > MEDIUM_URGENCY_ROI
+                                          else 'low'),
+                                details={
+                                    'strategy': 'binary',
+                                    'bid_sum': calc['bid_sum'],
+                                    'yes_bid': yes_best_bid,
+                                    'no_bid': no_best_bid,
+                                    'fees': calc['fees'],
+                                    'liquidity': min_liq,
+                                    'market_slug': market_slug,
+                                },
+                                timestamp=datetime.now(),
+                                net_profit_after_fees=expected_profit,
+                                merge_advice="Mint complete set for $1, sell YES + NO shares",
+                                estimated_slippage=0.0,
+                                net_profit_after_slippage=expected_profit,
+                            )
+                    else:
+                        self.diagnostics['filtered_low_liquidity'] += 1
 
-                # Urgency classification
-                urgency = 'high' if roi > self.HIGH_URGENCY_ROI else 'medium' if roi > self.MEDIUM_URGENCY_ROI else 'low'
+            return None
 
-                # Get market name
-                market_name = (market.get('question') or
-                             market.get('title') or
-                             market.get('description') or
-                             'Unknown Market')[:80]
-
-                market_id = (market.get('condition_id') or
-                           market.get('id') or
-                           market.get('market_id') or
-                           'unknown')
-
-                self.diagnostics['single_condition_found'] += 1
-
-                return ArbitrageOpportunity(
-                    market_id=str(market_id),
-                    market_name=market_name,
-                    opportunity_type='single_condition',
-                    expected_profit=expected_profit,
-                    roi=roi,
-                    capital_required=capital_required,
-                    risk_score=risk_score,
-                    urgency=urgency,
-                    details={
-                        'yes_price': yes_best_ask,
-                        'no_price': no_best_ask,
-                        'sum_price': sum_price,
-                        'deviation': deviation,
-                        'liquidity': min_liquidity,
-                        'action': 'buy_both' if sum_price < 1.0 else 'sell_both'
-                    },
-                    timestamp=datetime.now()
-                )
         except Exception as e:
             logger.debug(f"Error in single-condition detection: {e}")
+            return None
 
-        return None
-
+    # ------------------------------------------------------------------
+    # NegRisk Event-Level Arbitrage
+    # Buy arb: sum(YES best asks) < 1.0 -> buy all YES + merge
+    # Sell arb: sum(YES best bids) > 1.0 -> mint + sell all YES
+    # ------------------------------------------------------------------
     def detect_negrisk_arbitrage(
         self,
-        market: Dict,
-        orderbooks: Dict[str, Dict]
+        event_id: str,
+        event_title: str,
+        conditions_data: List,
+        slippage_estimator=None,
     ) -> Optional[ArbitrageOpportunity]:
         """
-        Strategy 2: NegRisk Rebalancing (Σ prices ≠ 1.0 across N≥3 conditions)
-        IMDEA Research: $28.99M extracted, 662 markets, 29× capital efficiency
+        Event-level NegRisk arbitrage detection.
+
+        Args:
+            event_id: The event identifier
+            event_title: Human-readable event title
+            conditions_data: list of (condition_dict, yes_token_id, yes_orderbook) tuples
+            slippage_estimator: optional slippage estimator
+
+        Buy arb: sum of all YES best asks across conditions < 1.0
+        Sell arb: sum of all YES best bids across conditions > 1.0
         """
         self.diagnostics['negrisk_checked'] += 1
 
-        # Filter out closed/archived markets
-        if market.get('closed') or market.get('archived') or not market.get('active'):
-            return None
-
-        # Get tokens from market
-        tokens = (market.get('tokens') or
-                 market.get('outcomes') or
-                 market.get('options') or [])
-
-        # Only NegRisk markets (N≥3 mutually exclusive outcomes)
-        if len(tokens) < 3:
+        if len(conditions_data) < NEGRISK_MIN_CONDITIONS:
             return None
 
         try:
-            prices = []
-            liquidities = []
+            ask_prices = []
+            bid_prices = []
+            liquidities_ask = []
+            liquidities_bid = []
+            all_asks_lists = []
+            all_bids_lists = []
+            condition_names = []
 
-            for token in tokens:
-                # Extract token_id from dict
-                if isinstance(token, dict):
-                    token_id = token.get('token_id') or token.get('id')
-                else:
-                    return None  # Can't process string tokens
-
-                if not token_id or token_id not in orderbooks:
-                    return None
-
-                book = orderbooks[token_id]
+            for condition, yes_tid, book in conditions_data:
                 if not book:
-                    return None
+                    continue
 
                 asks = book.get('asks', [])
-                if not asks:
-                    return None
+                bids = book.get('bids', [])
 
-                best_ask = float(asks[0].get('price', 0))
+                best_ask = _get_best_ask(asks)
+                best_bid = _get_best_bid(bids)
 
-                if best_ask == 0:
-                    return None
+                cond_name = (condition.get('question') or condition.get('title') or '')
+                condition_names.append(cond_name[:40])
 
-                prices.append(best_ask)
+                if best_ask > 0:
+                    ask_prices.append(best_ask)
+                    all_asks_lists.append(asks)
+                    ask_liq = sum(float(a.get('size', 0)) for a in asks[:ORDERBOOK_DEPTH])
+                    liquidities_ask.append(ask_liq)
 
-                # Calculate liquidity
-                liquidity = sum(float(ask.get('size', 0)) for ask in asks[:5])
-                liquidities.append(liquidity)
+                if best_bid > 0:
+                    bid_prices.append(best_bid)
+                    all_bids_lists.append(bids)
+                    bid_liq = sum(float(b.get('size', 0)) for b in bids[:ORDERBOOK_DEPTH])
+                    liquidities_bid.append(bid_liq)
 
-            # Check probability sum deviation
-            prob_sum = sum(prices)
-            deviation = abs(1.0 - prob_sum)
+            ask_sum = sum(ask_prices) if ask_prices else 0
+            bid_sum = sum(bid_prices) if bid_prices else 0
 
-            # Log ALL deviations for debugging
-            if deviation > 0:
-                logger.debug(f"NegRisk deviation found: {deviation:.4f} (sum={prob_sum:.4f})")
+            logger.debug(
+                f"Event {event_id}: YES ask prices={[f'{p:.4f}' for p in ask_prices]} "
+                f"ask_sum={ask_sum:.4f}, bid_sum={bid_sum:.4f}")
 
-            # Filter out unrealistic deviations (>50% = likely stale/closed market)
-            if deviation > self.MAX_PROFIT_THRESHOLD:
-                return None
+            # Get a slug for URL (use first condition's slug or event slug)
+            first_cond = conditions_data[0][0] if conditions_data else {}
+            market_slug = (first_cond.get('_event_slug') or
+                           first_cond.get('market_slug') or
+                           first_cond.get('slug', ''))
 
-            # Check if profitable
-            if deviation > self.MIN_PROFIT_THRESHOLD:
-                min_liquidity = min(liquidities)
+            # --- Buy arb: ask_sum < 1.0 ---
+            if (ask_prices and len(ask_prices) >= NEGRISK_MIN_CONDITIONS
+                    and ask_sum < 1.0):
+                calc = self.calculate_buy_arb(ask_prices)
+                net_profit_per_unit = calc['net_profit']
 
-                if min_liquidity < self.MIN_LIQUIDITY:
-                    return None
+                if (net_profit_per_unit > MIN_PROFIT_THRESHOLD
+                        and net_profit_per_unit < MAX_PROFIT_THRESHOLD):
+                    min_liq = min(liquidities_ask) if liquidities_ask else 0
+                    if min_liq < MIN_LIQUIDITY:
+                        self.diagnostics['filtered_low_liquidity'] += 1
+                    else:
+                        expected_profit = net_profit_per_unit * min_liq
+                        capital_required = calc['capital_required'] * min_liq
+                        roi = calc['roi_pct'] / 100.0
 
-                capital_required = prob_sum * min_liquidity
-                expected_profit = deviation * min_liquidity
+                        # Slippage
+                        est_slippage = 0.0
+                        net_after_slippage = expected_profit
+                        if slippage_estimator:
+                            max_slip = max(
+                                slippage_estimator.estimate_slippage_from_book(
+                                    al, DEFAULT_TRADE_SIZE).get('slippage_pct', 0)
+                                for al in all_asks_lists
+                            ) if all_asks_lists else 0
+                            est_slippage = max_slip
+                            if est_slippage > SLIPPAGE_TOLERANCE:
+                                self.diagnostics['filtered_high_slippage'] += 1
+                                return None
+                            slippage_cost = est_slippage * capital_required
+                            net_after_slippage = expected_profit - slippage_cost
+                            if net_after_slippage <= 0:
+                                return None
 
-                # Apply 29× capital efficiency multiplier from research
-                effective_roi = (deviation / prob_sum) * self.NEGRISK_MULTIPLIER if prob_sum > 0 else 0
-                roi = deviation / prob_sum if prob_sum > 0 else 0
+                        self.diagnostics['negrisk_found'] += 1
+                        return ArbitrageOpportunity(
+                            market_id=str(event_id),
+                            market_name=event_title[:80] or 'Unknown Event',
+                            opportunity_type='BUY_ARB',
+                            expected_profit=expected_profit,
+                            roi=roi,
+                            capital_required=capital_required,
+                            risk_score=self._calculate_risk_score(
+                                first_cond, 'negrisk'),
+                            urgency=('high' if roi > HIGH_URGENCY_ROI
+                                      else 'medium' if roi > MEDIUM_URGENCY_ROI
+                                      else 'low'),
+                            details={
+                                'strategy': 'negrisk',
+                                'num_conditions': len(conditions_data),
+                                'ask_sum': calc['ask_sum'],
+                                'yes_ask_prices': [f"{p:.4f}" for p in ask_prices],
+                                'fees': calc['fees'],
+                                'min_liquidity': min_liq,
+                                'capital_efficiency': f'{CAPITAL_EFFICIENCY_MULTIPLIER}x',
+                                'event_title': event_title,
+                                'market_slug': market_slug,
+                            },
+                            timestamp=datetime.now(),
+                            net_profit_after_fees=expected_profit,
+                            merge_advice=(
+                                "Buy full set of YES shares and merge "
+                                "via CTF/NegRisk contract for instant profit"),
+                            estimated_slippage=est_slippage,
+                            net_profit_after_slippage=net_after_slippage,
+                        )
 
-                risk_score = self._calculate_risk_score(market, 'negrisk')
-                urgency = 'high' if effective_roi > self.HIGH_URGENCY_ROI else 'medium'
+            # --- Sell arb: bid_sum > 1.0 ---
+            if (bid_prices and len(bid_prices) >= NEGRISK_MIN_CONDITIONS
+                    and bid_sum > 1.0):
+                calc = self.calculate_sell_arb(bid_prices)
+                net_profit_per_unit = calc['net_profit']
 
-                market_name = (market.get('question') or
-                             market.get('title') or
-                             market.get('description') or
-                             'Unknown Market')[:80]
+                if (net_profit_per_unit > MIN_PROFIT_THRESHOLD
+                        and net_profit_per_unit < MAX_PROFIT_THRESHOLD):
+                    min_liq = min(liquidities_bid) if liquidities_bid else 0
+                    if min_liq < MIN_LIQUIDITY:
+                        self.diagnostics['filtered_low_liquidity'] += 1
+                    else:
+                        expected_profit = net_profit_per_unit * min_liq
+                        capital_required = calc['capital_required'] * min_liq
+                        roi = calc['roi_pct'] / 100.0
 
-                market_id = (market.get('condition_id') or
-                           market.get('id') or
-                           market.get('market_id') or
-                           'unknown')
+                        # Slippage
+                        est_slippage = 0.0
+                        net_after_slippage = expected_profit
+                        if slippage_estimator:
+                            max_slip = max(
+                                slippage_estimator.estimate_slippage_from_book(
+                                    bl, DEFAULT_TRADE_SIZE).get('slippage_pct', 0)
+                                for bl in all_bids_lists
+                            ) if all_bids_lists else 0
+                            est_slippage = max_slip
+                            if est_slippage > SLIPPAGE_TOLERANCE:
+                                self.diagnostics['filtered_high_slippage'] += 1
+                                return None
+                            slippage_cost = est_slippage * capital_required
+                            net_after_slippage = expected_profit - slippage_cost
+                            if net_after_slippage <= 0:
+                                return None
 
-                self.diagnostics['negrisk_found'] += 1
+                        self.diagnostics['negrisk_found'] += 1
+                        return ArbitrageOpportunity(
+                            market_id=str(event_id),
+                            market_name=event_title[:80] or 'Unknown Event',
+                            opportunity_type='SELL_ARB',
+                            expected_profit=expected_profit,
+                            roi=roi,
+                            capital_required=capital_required,
+                            risk_score=self._calculate_risk_score(
+                                first_cond, 'negrisk'),
+                            urgency=('high' if roi > HIGH_URGENCY_ROI
+                                      else 'medium' if roi > MEDIUM_URGENCY_ROI
+                                      else 'low'),
+                            details={
+                                'strategy': 'negrisk',
+                                'num_conditions': len(conditions_data),
+                                'bid_sum': calc['bid_sum'],
+                                'yes_bid_prices': [f"{p:.4f}" for p in bid_prices],
+                                'fees': calc['fees'],
+                                'min_liquidity': min_liq,
+                                'capital_efficiency': f'{CAPITAL_EFFICIENCY_MULTIPLIER}x',
+                                'event_title': event_title,
+                                'market_slug': market_slug,
+                            },
+                            timestamp=datetime.now(),
+                            net_profit_after_fees=expected_profit,
+                            merge_advice=(
+                                "Mint complete set for $1 via NegRisk Adapter, "
+                                "sell all YES shares for profit"),
+                            estimated_slippage=est_slippage,
+                            net_profit_after_slippage=net_after_slippage,
+                        )
 
-                return ArbitrageOpportunity(
-                    market_id=str(market_id),
-                    market_name=market_name,
-                    opportunity_type='negrisk',
-                    expected_profit=expected_profit,
-                    roi=roi,
-                    capital_required=capital_required,
-                    risk_score=risk_score,
-                    urgency=urgency,
-                    details={
-                        'num_conditions': len(tokens),
-                        'prices': [f"{p:.4f}" for p in prices],
-                        'prob_sum': prob_sum,
-                        'deviation': deviation,
-                        'min_liquidity': min_liquidity,
-                        'capital_efficiency': f'{self.NEGRISK_MULTIPLIER}×',
-                        'action': 'buy_all' if prob_sum < 1.0 else 'sell_all'
-                    },
-                    timestamp=datetime.now()
-                )
+            return None
+
         except Exception as e:
             logger.debug(f"Error in NegRisk detection: {e}")
+            return None
 
-        return None
-
+    # ------------------------------------------------------------------
+    # Risk scoring
+    # ------------------------------------------------------------------
     def _calculate_risk_score(self, market: Dict, strategy_type: str) -> float:
-        """
-        Calculate risk score (0-1, lower is better)
-        Factors: Resolution date, liquidity, oracle risk
-        """
+        """Calculate risk score (0-1, lower is better)"""
         try:
             risk = 0.0
 
-            # Time to resolution risk
-            end_date_str = (market.get('end_date_iso') or
-                          market.get('end_date') or
-                          market.get('close_time'))
-
+            end_date_str = (market.get('end_date_iso') or market.get('end_date') or
+                            market.get('close_time'))
             if end_date_str:
                 try:
                     end_date = datetime.fromisoformat(str(end_date_str).replace('Z', '+00:00'))
-                    days_to_resolution = (end_date - datetime.now()).days
-
-                    # Higher risk near resolution (oracle manipulation)
-                    if days_to_resolution < 2:
+                    days = (end_date - datetime.now()).days
+                    if days < 2:
                         risk += 0.4
-                    elif days_to_resolution < 7:
+                    elif days < 7:
                         risk += 0.2
-                except:
+                except Exception:
                     pass
 
-            # Strategy-specific risks
             if strategy_type == 'negrisk':
-                # More complex execution = more risk
                 num_tokens = len(market.get('tokens', []))
                 risk += min(0.2, num_tokens * 0.03)
 
-            # Subjective oracle risk
-            question = (market.get('question') or
-                       market.get('title') or
-                       market.get('description') or '').lower()
+            question = (market.get('question') or market.get('title') or
+                        market.get('description') or '').lower()
 
-            subjective_keywords = ['best', 'winner', 'better', 'more popular', 'succeed', 'who will']
-            if any(keyword in question for keyword in subjective_keywords):
+            subjective_kw = ['best', 'winner', 'better', 'more popular', 'succeed', 'who will']
+            objective_kw = ['election', 'vote', 'score', 'price above', 'gdp', 'temperature']
+
+            if any(k in question for k in subjective_kw):
                 risk += 0.3
+            if any(k in question for k in objective_kw):
+                risk -= 0.1  # Lower risk for objective markets
 
-            return min(1.0, risk)
+            return max(0.0, min(1.0, risk))
+        except Exception:
+            return 0.5
 
-        except Exception as e:
-            logger.debug(f"Error calculating risk: {e}")
-            return 0.5  # Default medium risk
 
+# ============================================================================
+# ALERT MANAGER - WITH NOTIFICATION INTEGRATION
+# ============================================================================
 
 class AlertManager:
-    """Manage and display opportunities"""
+    """Manage and display opportunities with multi-channel notifications"""
 
-    def __init__(self):
-        self.displayed_opportunities = set()
+    def __init__(self, notification_manager=None):
+        self.displayed_opportunities = {}  # {opp_key: timestamp}
+        self.notification_manager = notification_manager
 
     def display_opportunity(self, opp: ArbitrageOpportunity):
-        """Display opportunity in formatted way"""
+        """Display BUY_ARB / SELL_ARB opportunity and send notifications"""
 
-        # Avoid duplicate alerts (within 5 minutes)
         opp_key = f"{opp.market_id}_{opp.opportunity_type}"
+
+        # Rate limit: same opportunity within ALERT_RATE_LIMIT_SECONDS
+        now = time.time()
         if opp_key in self.displayed_opportunities:
-            return
-        self.displayed_opportunities.add(opp_key)
+            last_time = self.displayed_opportunities[opp_key]
+            if now - last_time < ALERT_RATE_LIMIT_SECONDS:
+                return
+        self.displayed_opportunities[opp_key] = now
 
-        # Color coding
-        urgency_symbol = "🔴" if opp.urgency == 'high' else "🟡" if opp.urgency == 'medium' else "🟢"
+        # Console output
+        urgency_symbol = ("🔴" if opp.urgency == 'high'
+                           else "🟡" if opp.urgency == 'medium'
+                           else "🟢")
 
-        print("\n" + "="*80)
-        print(f"{urgency_symbol} ARBITRAGE OPPORTUNITY DETECTED - {opp.opportunity_type.upper()}")
-        print("="*80)
+        is_buy = opp.opportunity_type == 'BUY_ARB'
+        strategy = opp.details.get('strategy', 'unknown')
+
+        # Build Polymarket URL
+        slug = opp.details.get('market_slug', '')
+        if strategy == 'negrisk' and slug:
+            market_url = f"https://polymarket.com/event/{slug}"
+        elif slug:
+            market_url = f"https://polymarket.com/market/{slug}"
+        else:
+            market_url = ''
+
+        print("\n" + "=" * 80)
+        print(f"{urgency_symbol} {opp.opportunity_type} OPPORTUNITY ({strategy})")
+        print("=" * 80)
         print(f"Market: {opp.market_name}")
-        print(f"Expected Profit: ${opp.expected_profit:.2f}")
-        print(f"ROI: {opp.roi*100:.2f}%")
-        print(f"Capital Required: ${opp.capital_required:.2f}")
-        print(f"Risk Score: {opp.risk_score:.2f}/1.00")
-        print(f"Urgency: {opp.urgency.upper()}")
+        if market_url:
+            print(f"URL: {market_url}")
+
+        if is_buy:
+            ask_sum = opp.details.get('ask_sum', 0)
+            print(f"sum (best ask): {ask_sum:.4f} < 1.00")
+        else:
+            bid_sum = opp.details.get('bid_sum', 0)
+            print(f"sum (best bid): {bid_sum:.4f} > 1.00")
+
+        print(f"Net Profit: ${opp.net_profit_after_fees:.4f} (ROI: {opp.roi * 100:.2f}%)")
+        print(f"Capital: ${opp.capital_required:.2f}" +
+              (" (mint)" if not is_buy else ""))
+
+        if opp.merge_advice:
+            print(f"Action: {opp.merge_advice}")
+
+        if opp.estimated_slippage > 0:
+            print(f"Est. Slippage: {opp.estimated_slippage * 100:.2f}%")
+            print(f"Net After Slippage: ${opp.net_profit_after_slippage:.4f}")
+
+        print(f"Risk: slippage + {'gas' if is_buy else 'mint gas'}")
+
         print(f"\nDetails:")
         for key, value in opp.details.items():
+            if key in ('market_slug', 'strategy'):
+                continue
             if isinstance(value, float):
                 print(f"  {key}: {value:.4f}")
             else:
                 print(f"  {key}: {value}")
         print(f"\nTimestamp: {opp.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
-        print("="*80 + "\n")
+        print("=" * 80 + "\n")
 
-        logger.info(f"OPPORTUNITY: {opp.opportunity_type} - ${opp.expected_profit:.2f} profit, {opp.roi*100:.1f}% ROI")
+        logger.info(
+            f"OPPORTUNITY: {opp.opportunity_type} ({strategy}) - "
+            f"${opp.net_profit_after_fees:.4f} profit, {opp.roi * 100:.1f}% ROI")
 
-    def generate_summary(self, opportunities: List[ArbitrageOpportunity], client_diag: Dict, detector_diag: Dict):
-        """Generate summary statistics with diagnostics"""
+        # Send external notifications
+        if self.notification_manager:
+            try:
+                asyncio.get_event_loop().create_task(
+                    self.notification_manager.send(opp)
+                )
+            except RuntimeError:
+                pass
 
-        print("\n" + "="*80)
-        print("📊 SCAN DIAGNOSTICS")
-        print("="*80)
+    def generate_summary(self, opportunities: List[ArbitrageOpportunity],
+                          client_diag: Dict, detector_diag: Dict):
+        """Generate summary with diagnostics"""
+
+        print("\n" + "=" * 80)
+        print("SCAN DIAGNOSTICS")
+        print("=" * 80)
         print(f"Markets fetched: {client_diag['markets_fetched']}")
+        print(f"  NegRisk events: {client_diag['negrisk_events_fetched']}")
+        print(f"  NegRisk markets extracted: {client_diag['negrisk_markets_extracted']}")
         print(f"Markets with tokens: {client_diag['markets_with_tokens']}")
         print(f"Orderbooks fetched: {client_diag['orderbooks_fetched']}")
         print(f"Orderbooks with data: {client_diag['orderbooks_with_data']}")
-        print(f"\nSingle-Condition markets checked: {detector_diag['single_condition_checked']}")
-        print(f"Single-Condition opportunities found: {detector_diag['single_condition_found']}")
-        print(f"NegRisk markets checked: {detector_diag['negrisk_checked']}")
-        print(f"NegRisk opportunities found: {detector_diag['negrisk_found']}")
-        print(f"\nMarkets with no orderbook: {detector_diag['no_orderbook']}")
-        print(f"Markets with no prices: {detector_diag['no_prices']}")
-        print("="*80)
+        print(f"\nSingle-Condition checked: {detector_diag['single_condition_checked']}")
+        print(f"Single-Condition found: {detector_diag['single_condition_found']}")
+        print(f"NegRisk checked: {detector_diag['negrisk_checked']}")
+        print(f"NegRisk found: {detector_diag['negrisk_found']}")
+        print(f"\nFiltered (low liquidity): {detector_diag['filtered_low_liquidity']}")
+        print(f"Filtered (high slippage): {detector_diag['filtered_high_slippage']}")
+        print(f"No orderbook: {detector_diag['no_orderbook']}")
+        print(f"No prices: {detector_diag['no_prices']}")
+        print("=" * 80)
 
         if not opportunities:
-            print("\n📊 No opportunities detected in this scan.\n")
+            print("\nNo opportunities detected in this scan.\n")
             return
 
-        total_profit = sum(opp.expected_profit for opp in opportunities)
-        total_capital = sum(opp.capital_required for opp in opportunities)
-        avg_roi = np.mean([opp.roi for opp in opportunities]) * 100
+        total_profit = sum(o.expected_profit for o in opportunities)
+        total_capital = sum(o.capital_required for o in opportunities)
+        avg_roi = np.mean([o.roi for o in opportunities]) * 100
 
         by_type = defaultdict(list)
-        for opp in opportunities:
-            by_type[opp.opportunity_type].append(opp)
+        for o in opportunities:
+            by_type[o.opportunity_type].append(o)
 
-        print("\n" + "="*80)
-        print("📊 OPPORTUNITIES SUMMARY")
-        print("="*80)
+        print("\n" + "=" * 80)
+        print("OPPORTUNITIES SUMMARY")
+        print("=" * 80)
         print(f"Total Opportunities: {len(opportunities)}")
-        print(f"Total Expected Profit: ${total_profit:.2f}")
+        print(f"Total Expected Profit: ${total_profit:.4f}")
         print(f"Total Capital Required: ${total_capital:.2f}")
         print(f"Average ROI: {avg_roi:.2f}%")
         print(f"\nBy Strategy:")
         for strategy, opps in by_type.items():
-            strategy_profit = sum(o.expected_profit for o in opps)
-            print(f"  {strategy}: {len(opps)} opportunities, ${strategy_profit:.2f} profit")
-        print("="*80 + "\n")
+            sp = sum(o.expected_profit for o in opps)
+            print(f"  {strategy}: {len(opps)} opportunities, ${sp:.4f} profit")
+        print("=" * 80 + "\n")
 
+
+# ============================================================================
+# MAIN BOT
+# ============================================================================
 
 class PredictionMarketBot:
-    """Main bot orchestrator - FULL MARKET SCANNER"""
+    """Main bot orchestrator: reads from SQLite DB, mid-price screens, fetches orderbooks only for candidates."""
 
-    def __init__(self, scan_interval: int = 120):
-        self.scan_interval = scan_interval
+    def __init__(self):
         self.detector = ArbitrageDetector()
-        self.alert_manager = AlertManager()
+        self.notification_manager = None
+        self.alert_manager = None
+        self.slippage_estimator = None
+        self.ws_handler = None
+        self.scanner_process = None
         self.scan_count = 0
 
-    async def analyze_market_batch(self, markets: List[Dict], client: PolymarketClient,
-                                   batch_num: int, total_batches: int) -> List[ArbitrageOpportunity]:
-        """Analyze a batch of markets concurrently"""
+    async def initialize(self):
+        """Initialize notification manager, slippage estimator"""
+        # Notifications
+        try:
+            from notifications import NotificationManager
+            self.notification_manager = NotificationManager()
+            logger.info("Notification manager initialized")
+        except ImportError:
+            logger.info("notifications.py not found, using console only")
+        except Exception as e:
+            logger.warning(f"Failed to init notifications: {e}")
+
+        self.alert_manager = AlertManager(notification_manager=self.notification_manager)
+
+        # Slippage estimator
+        try:
+            from orderbook_utils import SlippageEstimator
+            self.slippage_estimator = SlippageEstimator()
+            logger.info("Slippage estimator initialized")
+        except ImportError:
+            logger.info("orderbook_utils.py not found, skipping slippage estimation")
+        except Exception as e:
+            logger.warning(f"Failed to init slippage estimator: {e}")
+
+    def _read_markets_from_db(self) -> List[Dict]:
+        """Read all active markets from SQLite DB (instant)."""
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT condition_id, data, mid_price_sum, num_tokens, is_negrisk, "
+                "event_id, event_title, volume FROM markets WHERE active=1"
+            ).fetchall()
+            conn.close()
+
+            markets = []
+            for row in rows:
+                try:
+                    market_data = json.loads(row['data'])
+                    market_data['_db_mid_price_sum'] = row['mid_price_sum']
+                    market_data['_db_num_tokens'] = row['num_tokens']
+                    market_data['_db_is_negrisk'] = row['is_negrisk']
+                    market_data['_db_volume'] = row['volume']
+                    if row['is_negrisk']:
+                        market_data['_is_negrisk'] = True
+                        market_data['_event_id'] = row['event_id']
+                        market_data['_event_title'] = row['event_title']
+                    markets.append(market_data)
+                except (json.JSONDecodeError, Exception) as e:
+                    logger.debug(f"Failed to parse market data: {e}")
+                    continue
+            return markets
+        except Exception as e:
+            logger.error(f"Failed to read from DB: {e}")
+            return []
+
+    def _mid_price_screen(self, markets: List[Dict]) -> Dict[str, List[Dict]]:
+        """
+        Mid-price pre-screening with separate logic for binary vs NegRisk.
+
+        NegRisk (is_negrisk=1):
+          - Group by event_id, sum YES mid prices across all conditions in the event
+          - If event_sum < MID_SUM_THRESHOLD or > MID_SUM_UPPER -> all conditions are candidates
+          - Require >= NEGRISK_MIN_CONDITIONS per event
+          - Fallback: top N events by total volume
+
+        Binary (is_negrisk=0):
+          - mid_price_sum = YES_mid + NO_mid for each condition
+          - If < MID_SUM_THRESHOLD (buy) or > MID_SUM_UPPER (sell) -> candidate
+          - Fallback: top N by volume
+
+        Returns dict with 'negrisk', 'binary', and counts.
+        """
+        negrisk_events = defaultdict(list)  # event_id -> [market_dicts]
+        binary_pool = []
+
+        for m in markets:
+            if m.get('_db_is_negrisk'):
+                event_id = m.get('_event_id', '')
+                if event_id:
+                    negrisk_events[event_id].append(m)
+            else:
+                n_tokens = m.get('_db_num_tokens', 0)
+                if n_tokens >= 2:
+                    binary_pool.append(m)
+
+        # --- NegRisk screening: event-level YES sum ---
+        negrisk_cands = []
+        negrisk_events_passed = 0
+        negrisk_all_events = []  # [(event_id, conditions)]
+
+        for event_id, conditions in negrisk_events.items():
+            if len(conditions) < NEGRISK_MIN_CONDITIONS:
+                continue
+            negrisk_all_events.append((event_id, conditions))
+
+            event_sum = sum(m.get('_db_mid_price_sum', 0) for m in conditions)
+            if event_sum <= 0:
+                continue
+
+            logger.debug(
+                f"NegRisk event {event_id}: {len(conditions)} conditions, "
+                f"YES sum={event_sum:.4f}")
+
+            if event_sum < MID_SUM_THRESHOLD or event_sum > MID_SUM_UPPER:
+                negrisk_events_passed += 1
+                negrisk_cands.extend(conditions)
+
+        # NegRisk fallback: top N events by total volume
+        negrisk_total_conditions = sum(
+            len(c) for _, c in negrisk_all_events) if negrisk_all_events else 0
+        if not negrisk_cands and negrisk_all_events:
+            def _event_volume(ev):
+                return sum(m.get('_db_volume', 0) for m in ev[1])
+            negrisk_all_events.sort(key=_event_volume, reverse=True)
+            for _, conditions in negrisk_all_events[:NEGRISK_TOP_N_BY_VOLUME]:
+                negrisk_cands.extend(conditions)
+
+        # --- Binary screening: YES_mid + NO_mid ---
+        binary_cands = []
+        binary_mid_passed = 0
+
+        for m in binary_pool:
+            mid_sum = m.get('_db_mid_price_sum', 0)
+            if mid_sum <= 0:
+                continue
+            if mid_sum < MID_SUM_THRESHOLD or mid_sum > MID_SUM_UPPER:
+                binary_mid_passed += 1
+                binary_cands.append(m)
+
+        # Binary fallback: top N by volume
+        if not binary_cands:
+            binary_pool.sort(key=lambda m: m.get('_db_volume', 0), reverse=True)
+            binary_cands = binary_pool[:BINARY_TOP_N_BY_VOLUME]
+
+        return {
+            'negrisk': negrisk_cands,
+            'binary': binary_cands,
+            'negrisk_events_total': len(negrisk_all_events),
+            'negrisk_events_passed': negrisk_events_passed,
+            'negrisk_total': negrisk_total_conditions,
+            'binary_total': len(binary_pool),
+            'binary_mid_passed': binary_mid_passed,
+        }
+
+    async def analyze_negrisk_candidates(
+        self, candidates: List[Dict], client: PolymarketClient
+    ) -> List[ArbitrageOpportunity]:
+        """
+        Analyze NegRisk candidates grouped by event_id.
+        For each event: fetch YES orderbook for each condition, run event-level detection.
+        """
         opportunities = []
 
-        logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(markets)} markets)")
+        # Group by event_id
+        events = defaultdict(list)
+        for m in candidates:
+            event_id = m.get('_event_id', '')
+            if event_id:
+                events[event_id].append(m)
 
-        for i, market in enumerate(markets):
+        logger.info(f"Processing {len(events)} NegRisk events "
+                     f"({len(candidates)} total conditions)")
+
+        for event_id, conditions in events.items():
+            if len(conditions) < NEGRISK_MIN_CONDITIONS:
+                continue
+
             try:
-                market_name = (market.get('question') or
-                             market.get('title') or
-                             market.get('description') or
-                             'Unknown')[:60]
+                event_title = conditions[0].get('_event_title', '')
+                event_data = []  # [(condition_dict, yes_token_id, yes_orderbook)]
 
-                # Get tokens - CLOB API returns 'tokens' array with proper structure
-                tokens = market.get('tokens') or []
+                for condition in conditions:
+                    tokens = _parse_tokens(condition)
+                    if not tokens:
+                        continue
 
-                # Parse if it's a JSON string (from Gamma API)
-                if isinstance(tokens, str):
-                    try:
-                        tokens = json.loads(tokens)
-                    except:
-                        tokens = []
+                    # Find YES token
+                    yes_token_id = None
+                    for t in tokens:
+                        if isinstance(t, dict) and t.get('outcome') == 'Yes':
+                            yes_token_id = t.get('token_id') or t.get('id')
+                            break
 
-                # If tokens is still empty, try clob_token_ids from Gamma API
-                if not tokens:
-                    clob_token_ids = market.get('clob_token_ids')
-                    outcomes_str = market.get('outcomes') or market.get('options') or []
+                    if not yes_token_id:
+                        continue
 
-                    if clob_token_ids and outcomes_str:
-                        # Parse outcomes
-                        if isinstance(outcomes_str, str):
-                            try:
-                                outcomes_list = json.loads(outcomes_str)
-                            except:
-                                outcomes_list = []
-                        else:
-                            outcomes_list = outcomes_str
+                    book = await client.get_orderbook(yes_token_id)
+                    if book:
+                        event_data.append((condition, yes_token_id, book))
+                    await asyncio.sleep(DELAY_BETWEEN_ORDERBOOKS)
+                    client.diagnostics['markets_analyzed'] += 1
 
-                        # Parse clob_token_ids
-                        if isinstance(clob_token_ids, str):
-                            try:
-                                token_ids_list = json.loads(clob_token_ids)
-                            except:
-                                token_ids_list = []
-                        else:
-                            token_ids_list = clob_token_ids if isinstance(clob_token_ids, list) else []
-
-                        # Match outcomes with token_ids
-                        if len(token_ids_list) == len(outcomes_list):
-                            tokens = []
-                            for outcome, token_id in zip(outcomes_list, token_ids_list):
-                                tokens.append({
-                                    'outcome': outcome,
-                                    'token_id': token_id,
-                                    'price': 0.5  # Default, will be updated from orderbook
-                                })
-
-                if tokens and isinstance(tokens, list):
-                    client.diagnostics['markets_with_tokens'] += 1
-
-                if not tokens or not isinstance(tokens, list):
+                if len(event_data) < NEGRISK_MIN_CONDITIONS:
                     continue
 
-                # Log first market with tokens for debugging
-                if client.diagnostics['markets_with_tokens'] == 1:
-                    logger.info(f"📍 Sample market keys: {list(market.keys())}")
-                    logger.info(f"📍 Tokens found: {json.dumps(tokens, indent=2)}")
+                client.diagnostics['markets_with_tokens'] += len(event_data)
 
-                # Fetch orderbooks for all tokens
-                orderbooks = {}
-                for token in tokens[:10]:  # Limit to 10 tokens max
-                    # Handle different token formats
-                    if isinstance(token, dict):
-                        # CLOB API format: {token_id: "...", outcome: "Yes", ...}
-                        token_id = token.get('token_id') or token.get('id')
-                    elif isinstance(token, str):
-                        # Gamma API format: just strings like "Yes", "No" - we can't fetch orderbooks
-                        token_id = None
-                    else:
-                        token_id = None
+                opp = self.detector.detect_negrisk_arbitrage(
+                    event_id=event_id,
+                    event_title=event_title,
+                    conditions_data=event_data,
+                    slippage_estimator=self.slippage_estimator,
+                )
+                if opp:
+                    opportunities.append(opp)
+                    self.alert_manager.display_opportunity(opp)
 
-                    # Debug: Log what token_id we're trying to use
-                    if client.diagnostics['markets_with_tokens'] <= 3:
-                        logger.info(f"🔎 Token: {token}")
-                        logger.info(f"🔎 Extracted token_id: {token_id}")
+            except Exception as e:
+                logger.debug(f"Error analyzing NegRisk event {event_id}: {e}")
+                continue
 
-                    if token_id:
-                        book = await client.get_orderbook(token_id)
-                        if book:
-                            orderbooks[token_id] = book
-                            # Log first orderbook for debugging
-                            if client.diagnostics['orderbooks_with_data'] == 1:
-                                logger.info(f"✅ Got orderbook! Structure: {json.dumps(book, indent=2)[:500]}")
-                        else:
-                            if client.diagnostics['markets_with_tokens'] <= 3:
-                                logger.info(f"❌ Failed to fetch orderbook for token_id: {token_id}")
-                        await asyncio.sleep(0.05)  # Rate limiting
-                    else:
-                        if client.diagnostics['markets_with_tokens'] <= 3:
-                            logger.info(f"⚠️  No token_id found for token: {token}")
+            await asyncio.sleep(DELAY_BETWEEN_MARKETS)
 
-                # Detect Single-Condition Arbitrage
-                if len(tokens) == 2:
-                    # Extract token IDs
-                    token1_id = None
-                    token2_id = None
+        return opportunities
 
-                    if isinstance(tokens[0], dict):
-                        token1_id = tokens[0].get('token_id') or tokens[0].get('id')
-                    if isinstance(tokens[1], dict):
-                        token2_id = tokens[1].get('token_id') or tokens[1].get('id')
+    async def analyze_binary_batch(
+        self, markets: List[Dict], client: PolymarketClient,
+        batch_num: int = 1, total_batches: int = 1,
+    ) -> List[ArbitrageOpportunity]:
+        """
+        Analyze a batch of binary market candidates.
+        For each: fetch YES + NO orderbooks, run binary arb detection.
+        """
+        opportunities = []
+        logger.info(f"Processing binary batch {batch_num}/{total_batches} "
+                     f"({len(markets)} candidates)")
 
-                    if token1_id and token2_id:
-                        opp = self.detector.detect_single_condition_arbitrage(
-                            market,
-                            orderbooks.get(token1_id),
-                            orderbooks.get(token2_id)
-                        )
+        for market in markets:
+            try:
+                tokens = _parse_tokens(market)
+                if not tokens or len(tokens) < 2:
+                    continue
 
-                        if opp:
-                            opportunities.append(opp)
-                            self.alert_manager.display_opportunity(opp)
+                client.diagnostics['markets_with_tokens'] += 1
 
-                # Detect NegRisk Arbitrage
-                elif len(tokens) >= 3:
-                    opp = self.detector.detect_negrisk_arbitrage(market, orderbooks)
+                # Find YES and NO tokens
+                yes_tid = None
+                no_tid = None
+                for t in tokens:
+                    if isinstance(t, dict):
+                        tid = t.get('token_id') or t.get('id')
+                        outcome = t.get('outcome', '')
+                        if outcome == 'Yes':
+                            yes_tid = tid
+                        elif outcome == 'No':
+                            no_tid = tid
 
-                    if opp:
-                        opportunities.append(opp)
-                        self.alert_manager.display_opportunity(opp)
+                if not yes_tid or not no_tid:
+                    continue
 
-                await asyncio.sleep(0.1)  # Rate limiting
+                # Fetch orderbooks for both sides
+                yes_ob = await client.get_orderbook(yes_tid)
+                await asyncio.sleep(DELAY_BETWEEN_ORDERBOOKS)
+                no_ob = await client.get_orderbook(no_tid)
+                await asyncio.sleep(DELAY_BETWEEN_ORDERBOOKS)
 
+                opp = self.detector.detect_single_condition_arbitrage(
+                    market, yes_ob, no_ob,
+                    slippage_estimator=self.slippage_estimator,
+                )
+                if opp:
+                    opportunities.append(opp)
+                    self.alert_manager.display_opportunity(opp)
+
+                await asyncio.sleep(DELAY_BETWEEN_MARKETS)
                 client.diagnostics['markets_analyzed'] += 1
 
             except Exception as e:
-                logger.debug(f"  ⚠️  Error analyzing market: {e}")
+                logger.debug(f"Error analyzing binary market: {e}")
                 continue
 
         return opportunities
 
     async def run_single_scan(self):
-        """Run one complete scan cycle - FULL MARKET"""
+        """Run one detection cycle: read DB -> mid-price screen -> fetch orderbooks for candidates."""
         self.scan_count += 1
-        logger.info(f"\n{'='*80}")
-        logger.info(f"🔍 Starting FULL MARKET Scan #{self.scan_count}")
-        logger.info(f"{'='*80}\n")
+        t0 = time.time()
+        logger.info(f"\n{'=' * 80}")
+        logger.info(f"Starting scan #{self.scan_count} (DB read -> mid-price screen -> orderbook)")
+        logger.info(f"{'=' * 80}\n")
 
+        # Reset diagnostics
+        self.detector.diagnostics = {k: 0 for k in self.detector.diagnostics}
+
+        # Step 1: Read from DB (instant)
+        all_markets = self._read_markets_from_db()
+        if not all_markets:
+            logger.warning("No markets in DB. Waiting for background scanner...")
+            return []
+
+        # Step 2: Mid-price pre-screening (separate binary vs NegRisk)
+        screen = self._mid_price_screen(all_markets)
+        negrisk_cands = screen['negrisk']
+        binary_cands = screen['binary']
+        total_candidates = len(negrisk_cands) + len(binary_cands)
+
+        logger.info(
+            f"DB markets: {len(all_markets)} "
+            f"(binary: {screen['binary_total']}, "
+            f"negrisk: {screen['negrisk_total']} in "
+            f"{screen['negrisk_events_total']} events)"
+        )
+
+        # NegRisk logging
+        if screen.get('negrisk_events_passed', 0) == 0 and len(negrisk_cands) > 0:
+            logger.info(
+                f"  NegRisk: 0 events passed mid-screen (API prices normalized), "
+                f"using top {len(negrisk_cands)} conditions by volume"
+            )
+        else:
+            logger.info(
+                f"  NegRisk mid-screen: {screen.get('negrisk_events_passed', 0)} events passed "
+                f"-> {len(negrisk_cands)} conditions "
+                f"(event YES sum <{MID_SUM_THRESHOLD} or >{MID_SUM_UPPER})"
+            )
+
+        # Binary logging
+        binary_mid_passed = screen.get('binary_mid_passed', 0)
+        if binary_mid_passed > 0:
+            logger.info(
+                f"  Binary mid-screen: {binary_mid_passed}/{screen['binary_total']} passed "
+                f"(YES+NO sum <{MID_SUM_THRESHOLD} or >{MID_SUM_UPPER})")
+        else:
+            logger.info(
+                f"  Binary: {len(binary_cands)}/{screen['binary_total']} "
+                f"(top by volume, mid-screen={binary_mid_passed})")
+
+        logger.info(f"  Total candidates for orderbook: {total_candidates}")
+
+        if total_candidates == 0:
+            elapsed = time.time() - t0
+            logger.info(f"Scan #{self.scan_count} complete in {elapsed:.1f}s. "
+                         f"No candidates.")
+            return []
+
+        # Step 3: Fetch orderbooks and detect
         async with PolymarketClient() as client:
-            # Fetch ALL markets
-            all_markets = await client.get_all_markets()
-
-            if not all_markets:
-                logger.warning("⚠️  No markets fetched. This could mean:")
-                logger.warning("   1. Polymarket API is temporarily down")
-                logger.warning("   2. Network connectivity issues")
-                logger.warning("   3. API rate limiting")
-                logger.warning("   → Will retry next cycle...")
-                return
-
-            logger.info(f"🎯 Analyzing {len(all_markets)} markets for arbitrage...\n")
-
-            # Process in batches to manage memory and provide progress updates
-            batch_size = 50
             all_opportunities = []
-            total_batches = (len(all_markets) + batch_size - 1) // batch_size
 
-            for i in range(0, len(all_markets), batch_size):
-                batch = all_markets[i:i+batch_size]
-                batch_num = (i // batch_size) + 1
+            # 3a. NegRisk events (process all at once to maintain event grouping)
+            if negrisk_cands:
+                negrisk_opps = await self.analyze_negrisk_candidates(
+                    negrisk_cands, client)
+                all_opportunities.extend(negrisk_opps)
 
-                batch_opps = await self.analyze_market_batch(
-                    batch, client, batch_num, total_batches
-                )
-                all_opportunities.extend(batch_opps)
+            # 3b. Binary markets (process in batches)
+            if binary_cands:
+                total_batches = max(1, (len(binary_cands) + BATCH_SIZE - 1) // BATCH_SIZE)
+                for i in range(0, len(binary_cands), BATCH_SIZE):
+                    batch = binary_cands[i:i + BATCH_SIZE]
+                    batch_num = (i // BATCH_SIZE) + 1
+                    batch_opps = await self.analyze_binary_batch(
+                        batch, client, batch_num, total_batches)
+                    all_opportunities.extend(batch_opps)
+                    await asyncio.sleep(DELAY_BETWEEN_BATCHES)
 
-                # Small delay between batches
-                await asyncio.sleep(0.5)
+            # Build diagnostics for summary
+            client_diag = {
+                'markets_fetched': len(all_markets),
+                'negrisk_events_fetched': screen['negrisk_events_total'],
+                'negrisk_markets_extracted': len(negrisk_cands),
+                'markets_with_tokens': client.diagnostics['markets_with_tokens'],
+                'orderbooks_fetched': client.diagnostics['orderbooks_fetched'],
+                'orderbooks_with_data': client.diagnostics['orderbooks_with_data'],
+            }
 
-            # Generate summary with diagnostics
-            self.alert_manager.generate_summary(all_opportunities, client.diagnostics, self.detector.diagnostics)
+            self.alert_manager.generate_summary(
+                all_opportunities, client_diag, self.detector.diagnostics
+            )
 
-            logger.info(f"✓ Scan #{self.scan_count} complete. Found {len(all_opportunities)} opportunities.")
-            logger.info(f"⏰ Next scan in {self.scan_interval} seconds...\n")
+            elapsed = time.time() - t0
+            logger.info(
+                f"Scan #{self.scan_count} complete in {elapsed:.1f}s. "
+                f"db={len(all_markets)}, negrisk_cands={len(negrisk_cands)}, "
+                f"binary_cands={len(binary_cands)}, "
+                f"orderbooks={client.diagnostics['orderbooks_fetched']}, "
+                f"opportunities={len(all_opportunities)}"
+            )
+            logger.info(f"Next scan in {SCAN_INTERVAL} seconds...\n")
+
+            return all_opportunities
+
+    def _wait_for_db_data(self, max_wait: int = 120):
+        """Block until DB has data (first run). Poll every 5s, max 2min."""
+        import os
+        if not os.path.exists(DB_FILE):
+            logger.info(f"DB file {DB_FILE} not found, waiting for background scanner...")
+
+        waited = 0
+        while waited < max_wait:
+            try:
+                if os.path.exists(DB_FILE):
+                    conn = sqlite3.connect(DB_FILE, timeout=5)
+                    count = conn.execute(
+                        "SELECT COUNT(*) FROM markets WHERE active=1"
+                    ).fetchone()[0]
+                    conn.close()
+                    if count > 0:
+                        logger.info(f"DB ready: {count} active markets (waited {waited}s)")
+                        return True
+            except Exception:
+                pass  # DB not ready yet
+            time.sleep(5)
+            waited += 5
+            if waited % 15 == 0:
+                logger.info(f"Still waiting for DB data... ({waited}s elapsed)")
+
+        logger.error(f"DB still empty after {max_wait}s. Starting anyway.")
+        return False
 
     async def run_continuous(self):
-        """Run continuous monitoring - FULL MARKET"""
-        logger.info("🚀 Prediction Market Arbitrage Bot Starting (FULL MARKET MODE)...")
-        logger.info(f"📊 Scanning up to 200 markets per cycle")
-        logger.info(f"⏰ Scan interval: {self.scan_interval} seconds")
-        logger.info(f"💰 Profit threshold: ${self.detector.MIN_PROFIT_THRESHOLD*100:.1f}¢ to ${self.detector.MAX_PROFIT_THRESHOLD*100:.1f}¢")
-        logger.info("\nStrategies Active:")
-        logger.info("  1. Single-Condition Arbitrage (YES+NO≠$1.00)")
-        logger.info("  2. NegRisk Rebalancing (Σprices≠1.00, 29× efficiency)")
-        logger.info("\n" + "="*80 + "\n")
+        """Run continuous monitoring with background scanner + WebSocket."""
+        await self.initialize()
 
+        logger.info("Prediction Market Arbitrage Bot v2.0 Starting...")
+        logger.info(f"Scan interval: {SCAN_INTERVAL}s (frontend detection)")
+        logger.info(f"Background scan interval: {BACKGROUND_SCAN_INTERVAL}s")
+        logger.info(f"Mid-price screen: buy < {MID_SUM_THRESHOLD}, sell > {MID_SUM_UPPER}")
+        logger.info(f"Min profit: ${MIN_PROFIT_THRESHOLD}")
+        logger.info(f"Min liquidity: ${MIN_LIQUIDITY}")
+        logger.info(f"Slippage tolerance: {SLIPPAGE_TOLERANCE * 100}%")
+        logger.info(f"Notifications: {NOTIFICATION_METHODS}")
+        logger.info(f"WebSocket: {'enabled' if WS_ENABLED else 'disabled'}")
+        logger.info(f"DB file: {DB_FILE}")
+        logger.info("=" * 80 + "\n")
+
+        # Start background scanner process
+        try:
+            from scanner_process import start_scanner_process
+            self.scanner_process = start_scanner_process(DB_FILE)
+            logger.info(f"Background scanner process started (PID: {self.scanner_process.pid})")
+        except Exception as e:
+            logger.error(f"Failed to start background scanner: {e}")
+            logger.warning("Running without background scanner - DB may be stale")
+
+        # Wait for DB to have data (first run boundary handling)
+        self._wait_for_db_data(max_wait=120)
+
+        # Start WebSocket
+        ws_task = None
+        if WS_ENABLED:
+            try:
+                from websocket_handler import WebSocketHandler
+                self.ws_handler = WebSocketHandler(
+                    detector=self.detector,
+                    alert_manager=self.alert_manager,
+                    slippage_estimator=self.slippage_estimator,
+                )
+                ws_task = asyncio.create_task(self.ws_handler.start())
+                logger.info("WebSocket handler started")
+            except ImportError:
+                logger.info("websocket_handler.py not found, using polling only")
+            except Exception as e:
+                logger.warning(f"Failed to start WebSocket: {e}")
+
+        # Main detection loop
         while True:
             try:
+                # Check if scanner process is alive, restart if dead
+                if self.scanner_process and not self.scanner_process.is_alive():
+                    logger.warning("Background scanner process died, restarting...")
+                    try:
+                        from scanner_process import start_scanner_process
+                        self.scanner_process = start_scanner_process(DB_FILE)
+                        logger.info(f"Scanner restarted (PID: {self.scanner_process.pid})")
+                    except Exception as e:
+                        logger.error(f"Failed to restart scanner: {e}")
+
                 await self.run_single_scan()
-                await asyncio.sleep(self.scan_interval)
+                await asyncio.sleep(SCAN_INTERVAL)
+
             except KeyboardInterrupt:
-                logger.info("\n\n🛑 Bot stopped by user")
+                logger.info("\nBot stopped by user")
                 break
             except Exception as e:
-                logger.error(f"⚠️  Error in main loop: {e}")
-                logger.info(f"   Retrying in {self.scan_interval} seconds...")
-                await asyncio.sleep(self.scan_interval)
+                logger.error(f"Error in main loop: {e}")
+                logger.info(f"Retrying in {SCAN_INTERVAL} seconds...")
+                await asyncio.sleep(SCAN_INTERVAL)
+
+        # Graceful shutdown
+        logger.info("Shutting down...")
+        if self.ws_handler:
+            await self.ws_handler.stop()
+        if self.scanner_process and self.scanner_process.is_alive():
+            logger.info("Terminating background scanner...")
+            self.scanner_process.terminate()
+            self.scanner_process.join(timeout=5)
+            if self.scanner_process.is_alive():
+                self.scanner_process.kill()
+            logger.info("Background scanner terminated")
 
 
 # ============================================================================
@@ -917,39 +1468,27 @@ class PredictionMarketBot:
 
 async def main():
     """Main entry point"""
-
     print("""
 ╔═══════════════════════════════════════════════════════════════════════════╗
-║                  PREDICTION MARKET ARBITRAGE BOT                          ║
-║                        FULL MARKET SCANNER                                ║
-║                                                                           ║
-║  Based on IMDEA Networks Research: $39.59M Arbitrage Extracted           ║
-║  April 2024 - April 2025                                                 ║
-║                                                                           ║
-║  Strategies:                                                             ║
-║    • Single-Condition: $10.58M extracted (7,051 conditions)              ║
-║    • NegRisk: $28.99M extracted (662 markets, 29× efficiency)            ║
-║                                                                           ║
-║  ✅ Filters: Active markets only, realistic spreads (1-50¢)              ║
-║  ✅ Scans: Up to 200 markets every 2 minutes                             ║
-║                                                                           ║
-║  ⚠️  DISCLAIMER: Detection only - NOT automatic execution                 ║
-║  ⚠️  Always verify opportunities manually before trading                  ║
-║  ⚠️  Prediction markets involve significant risk                          ║
+║              PREDICTION MARKET ARBITRAGE BOT v2.0                       ║
+║                   DB-BACKED MID-PRICE SCREENING                         ║
+║                                                                         ║
+║  Background:  Independent process scans all markets -> SQLite WAL DB   ║
+║  Frontend:    Read DB -> mid-price screen -> orderbook only for cands  ║
+║  Real-time:   WebSocket price updates + DB writes                      ║
+║  Detection:   Best Ask + Fee Deduction + Slippage Estimation           ║
+║  Alerts:      Console + Telegram + Discord                             ║
+║                                                                         ║
+║  ⚠️  DISCLAIMER: Detection only - NOT automatic execution               ║
 ╚═══════════════════════════════════════════════════════════════════════════╝
     """)
 
-    # Configuration
-    SCAN_INTERVAL = 120  # 2 minutes between full market scans
-
-    bot = PredictionMarketBot(
-        scan_interval=SCAN_INTERVAL
-    )
+    bot = PredictionMarketBot()
 
     try:
         await bot.run_continuous()
     except KeyboardInterrupt:
-        print("\n\n✋ Shutting down gracefully...")
+        print("\nShutting down gracefully...")
         logger.info("Bot shutdown complete")
 
 
@@ -957,4 +1496,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Goodbye!")
+        print("\nGoodbye!")
